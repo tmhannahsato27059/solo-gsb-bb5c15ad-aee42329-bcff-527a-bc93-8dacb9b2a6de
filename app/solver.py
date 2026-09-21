@@ -19,6 +19,13 @@
 * 图中存在负环 ⇔ 约束系统不可行。负环上的边按方向累加其权值，
   总和为负，即形如 ``0 <= 负数`` 的矛盾。
 
+可行诊断中每个节点的上下界还附带 **证据链**（``upper_proof`` /
+``lower_proof``）：上界链是参考节点到该节点的一条最短链（边权和等于上界），
+下界链是该节点回到参考节点的一条最短链（边权和的相反数等于下界）。
+多条等权最短链时，按各步骤四元组
+``(observation_id, constraint, from, to)`` 序列的字典序取最小者，
+与观测提交顺序无关。
+
 所有结果的顺序均按 (观测 ID, 约束类型) / 节点字典序确定，保证稳定输出。
 
 修复建议
@@ -197,6 +204,123 @@ def _canonicalize_cycle(cycle_edges: List[Edge]) -> List[Edge]:
     return cycle_edges[start_index:] + cycle_edges[:start_index]
 
 
+# 步骤四元组 (observation_id, constraint, from, to) 中约束类型的次序。
+_PROOF_KIND_RANK = {"upper": 0, "lower": 1}
+# 判定「紧边」时的浮点容差：只吸收同值不同运算顺序导致的舍入差，
+# 不会把真正更长的路径纳入最短链 DAG。
+_PROOF_EPS = 1e-9
+
+
+def _edge_key(e: Edge) -> tuple:
+    """步骤四元组 (observation_id, constraint, from, to) 的字典序键。"""
+    return (e.observation_id, _PROOF_KIND_RANK[e.kind], e.u, e.v)
+
+
+def _ordered_out_edges(edges: Sequence[Edge], nodes: Sequence[str]):
+    """按步骤四元组字典序排好的出边表 adj[u] = [e, ...]。"""
+    adj = {v: [] for v in nodes}
+    for e in edges:
+        if e.u in adj and e.v in adj:
+            adj[e.u].append(e)
+    for out in adj.values():
+        out.sort(key=_edge_key)
+    return adj
+
+
+def _lex_smallest_shortest_path(
+    start: str,
+    target: str,
+    dist,
+    adj,
+    distance_to_target: bool,
+) -> List[Edge]:
+    """求 start -> target 的字典序最小最短（简单）链。
+
+    ``distance_to_target`` 指明 ``dist`` 的语义：
+
+    * ``False``：dist 为距 start（链的起点）的最短距离，紧边条件
+      ``dist[v] == dist[u] + weight``（上界链使用）；
+    * ``True``：dist 为到 target（链的终点）的最短距离，紧边条件
+      ``dist[u] == weight + dist[v]``（下界链使用）。
+
+    紧边子图中任意 start->target 路径的权值和都等于最短路；由于权值和
+    为 0 的环（非简单路径）会制造任意长但字典序更小的前缀，这里只在
+    简单路径中取字典序最小者。
+
+    贪心每一步选择四元组字典序最小、且其终点在「不经过已访问节点」的
+    前提下仍能沿紧边到达 target 的边。该可行性检查保证被选前缀总能补成
+    一条简单最短链，故无需回溯，且选择只由图的四元组次序决定，
+    与观测提交顺序无关。
+    """
+    if start == target:
+        return []
+
+    def can_reach(src: str, blocked: frozenset) -> bool:
+        """紧边子图中 src 不经过 blocked 节点能否到达 target。"""
+        if src == target:
+            return True
+        seen = {src}
+        stack = [src]
+        while stack:
+            u = stack.pop()
+            for e in adj[u]:
+                if not _is_tight(e, dist, distance_to_target):
+                    continue
+                if e.v == target:
+                    return True
+                if e.v not in seen and e.v not in blocked:
+                    seen.add(e.v)
+                    stack.append(e.v)
+        return False
+
+    path: List[Edge] = []
+    cur = start
+    visited = {start}
+    while cur != target:
+        chosen: Optional[Edge] = None
+        for e in adj[cur]:
+            if e.v in visited:
+                continue
+            if not _is_tight(e, dist, distance_to_target):
+                continue
+            if can_reach(e.v, frozenset(visited)):
+                chosen = e
+                break
+        if chosen is None:  # 理论上不会发生：cur 本身即可达 target
+            break
+        path.append(chosen)
+        cur = chosen.v
+        visited.add(cur)
+    return path
+
+
+def _is_tight(e: Edge, dist, distance_to_target: bool) -> bool:
+    """边 e 是否为关于 dist 的紧边。
+
+    distance_to_target=False（距链起点的最短路）：dist[v] == dist[u] + w；
+    distance_to_target=True （到链终点的最短路）：dist[u] == w + dist[v]。
+    """
+    du, dv = dist[e.u], dist[e.v]
+    if du == float("inf") or dv == float("inf"):
+        return False
+    if distance_to_target:
+        gap = du - (e.weight + dv)
+    else:
+        gap = dv - (du + e.weight)
+    return abs(gap) <= _PROOF_EPS * (1.0 + abs(du) + abs(dv))
+
+
+def _step_dict(e: Edge) -> dict:
+    """把边格式化为证据链步骤（from/to 保持边在原图中的方向）。"""
+    return {
+        "observation_id": e.observation_id,
+        "constraint": e.kind,
+        "from": e.u,
+        "to": e.v,
+        "weight": _norm(e.weight),
+    }
+
+
 def diagnose(
     nodes: Sequence[str],
     reference: str,
@@ -207,6 +331,11 @@ def diagnose(
     返回字典：
       可行   -> {"feasible": True, "reference": ..., "node_bounds": [...],
                  "unconstrained_nodes": [...]}
+               其中每个 node_bound 附带：
+                 * upper_proof：reference -> 该节点的字典序最小最短链
+                   （步骤权值和等于 upper），参考节点为空链，不可达为 None；
+                 * lower_proof：该节点 -> reference 的字典序最小最短链
+                   （步骤权值和的相反数等于 lower），参考节点为空链，不可达为 None。
       不可行 -> {"feasible": False, "cycle": {"steps": [...],
                  "accumulated_bound": float, "contradiction": str}}
     """
@@ -255,6 +384,13 @@ def diagnose(
     ]
     dist_rev, _ = _bellman_ford(reverse_edges, ordered_nodes, reference)
 
+    # 证据链：
+    # 上界链沿原图 reference -> v，关于 dist（距参考节点的最短路）紧；
+    # 下界链沿原图 v -> reference，关于 dist_rev（到参考节点的最短路）紧，
+    # 步骤按 v -> reference 的行走顺序排列。两者都在原图的出边表上做
+    # 字典序贪心，选择只由步骤四元组次序决定，与观测提交顺序无关。
+    adj = _ordered_out_edges(edges, ordered_nodes)
+
     inf = float("inf")
     node_bounds = []
     unconstrained: List[str] = []
@@ -266,11 +402,27 @@ def diagnose(
         constrained = reachable_forward and reachable_reverse
         if not constrained:
             unconstrained.append(v)
+        if reachable_forward:
+            upper_edges = _lex_smallest_shortest_path(
+                reference, v, dist, adj, distance_to_target=False
+            )
+            upper_proof = [_step_dict(e) for e in upper_edges]
+        else:
+            upper_proof = None
+        if reachable_reverse:
+            lower_edges = _lex_smallest_shortest_path(
+                v, reference, dist_rev, adj, distance_to_target=True
+            )
+            lower_proof = [_step_dict(e) for e in lower_edges]
+        else:
+            lower_proof = None
         node_bounds.append(
             {
                 "node": v,
                 "lower": lower,
                 "upper": upper,
+                "lower_proof": lower_proof,
+                "upper_proof": upper_proof,
                 "reachable_from_reference": reachable_forward,
                 "can_reach_reference": reachable_reverse,
                 "constrained": constrained,

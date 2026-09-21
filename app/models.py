@@ -90,6 +90,18 @@ class DiagnosisRequest(BaseModel):
         return collect_nodes(self.nodes, self.reference, self.observations)
 
 
+class ProofStep(BaseModel):
+    """证据链上的一步：差分约束图中参与最短链的一条边。"""
+
+    observation_id: str = Field(..., description="该步骤对应的观测 ID")
+    constraint: Literal["upper", "lower"] = Field(
+        ..., description="upper=对应 max 约束边，lower=对应 -min 约束边"
+    )
+    from_: str = Field(..., serialization_alias="from")
+    to: str
+    weight: float = Field(..., description="该边在差分约束图中的权重（毫秒）")
+
+
 class NodeBounds(BaseModel):
     node: str
     lower: Optional[float] = Field(
@@ -97,6 +109,20 @@ class NodeBounds(BaseModel):
     )
     upper: Optional[float] = Field(
         ..., description="x_node - x_reference 的最紧上界（毫秒），不可达时为 null"
+    )
+    upper_proof: Optional[List[ProofStep]] = Field(
+        ...,
+        description=(
+            "上界证据链：参考节点到该节点的一条最短链，步骤 weight 之和等于 upper；"
+            "参考节点为空链，不可达时为 null"
+        ),
+    )
+    lower_proof: Optional[List[ProofStep]] = Field(
+        ...,
+        description=(
+            "下界证据链：该节点回到参考节点的一条最短链，步骤 weight 之和的相反数"
+            "等于 lower；参考节点为空链，不可达时为 null"
+        ),
     )
     reachable_from_reference: bool = Field(
         ..., description="参考节点能否沿约束边到达该节点（决定上界）"

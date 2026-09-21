@@ -46,6 +46,199 @@ def test_parallel_paths_sharpen_bounds():
     assert bounds["B"] == (1.0, 10.0)
 
 
+def _chain_tuples(steps):
+    return [(s["observation_id"], s["constraint"], s["from"], s["to"]) for s in steps]
+
+
+def _assert_contiguous(steps, start, end):
+    assert steps[0]["from"] == start
+    assert steps[-1]["to"] == end
+    for prev, nxt in zip(steps, steps[1:]):
+        assert prev["to"] == nxt["from"]
+
+
+def test_proof_chains_basic():
+    # o1: x_B - x_A ∈ [1, 5]，o2: x_C - x_B ∈ [2, 4]
+    result = diagnose(
+        nodes=["A", "B", "C"],
+        reference="A",
+        observations=[_obs("o1", "A", "B", 1, 5), _obs("o2", "B", "C", 2, 4)],
+    )
+    by_node = {b["node"]: b for b in result["node_bounds"]}
+    # 参考节点使用空链
+    assert by_node["A"]["upper_proof"] == []
+    assert by_node["A"]["lower_proof"] == []
+    # 上界链：参考节点 -> 目标，权值和等于 upper
+    up = by_node["C"]["upper_proof"]
+    _assert_contiguous(up, "A", "C")
+    assert _chain_tuples(up) == [
+        ("o1", "upper", "A", "B"),
+        ("o2", "upper", "B", "C"),
+    ]
+    assert sum(s["weight"] for s in up) == 9.0
+    # 下界链：目标 -> 参考节点，权值和的相反数等于 lower
+    lp = by_node["C"]["lower_proof"]
+    _assert_contiguous(lp, "C", "A")
+    assert _chain_tuples(lp) == [
+        ("o2", "lower", "C", "B"),
+        ("o1", "lower", "B", "A"),
+    ]
+    assert -sum(s["weight"] for s in lp) == 3.0
+
+
+def test_proof_steps_carry_weight_field():
+    result = diagnose(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[_obs("o1", "A", "B", 2, 5)],
+    )
+    by_node = {b["node"]: b for b in result["node_bounds"]}
+    (up,) = by_node["B"]["upper_proof"]
+    (lp,) = by_node["B"]["lower_proof"]
+    assert up == {
+        "observation_id": "o1",
+        "constraint": "upper",
+        "from": "A",
+        "to": "B",
+        "weight": 5.0,
+    }
+    assert lp == {
+        "observation_id": "o1",
+        "constraint": "lower",
+        "from": "B",
+        "to": "A",
+        "weight": -2.0,
+    }
+
+
+def test_proof_tiebreak_lex_smallest_step_sequence():
+    # A->C 的等权最短上界链有两条：
+    #   direct: p1 上界边 A->C，权 1（一步）
+    #   via B : q1 上界边 A->B，权 1 + q2 上界边 B->C，权 0（两步）
+    # 序列字典序比较首步四元组：("p1","upper","A","C") < ("q1",...)，
+    # 因此选一步的 p1（注意：规则不是「边数最少」）。
+    result = diagnose(
+        nodes=["A", "B", "C"],
+        reference="A",
+        observations=[
+            _obs("p1", "A", "C", 0, 1),
+            _obs("q1", "A", "B", 0, 1),
+            _obs("q2", "B", "C", 0, 0),
+        ],
+    )
+    by_node = {b["node"]: b for b in result["node_bounds"]}
+    assert _chain_tuples(by_node["C"]["upper_proof"]) == [
+        ("p1", "upper", "A", "C")
+    ]
+
+    # 反向对照：首步四元组更小的多步链应胜过一步链。
+    #   direct: zz 上界边 A->C，权 1
+    #   via B : aa A->B 权 1 + bb B->C 权 0
+    result2 = diagnose(
+        nodes=["A", "B", "C"],
+        reference="A",
+        observations=[
+            _obs("zz", "A", "C", 0, 1),
+            _obs("aa", "A", "B", 0, 1),
+            _obs("bb", "B", "C", 0, 0),
+        ],
+    )
+    by_node2 = {b["node"]: b for b in result2["node_bounds"]}
+    assert _chain_tuples(by_node2["C"]["upper_proof"]) == [
+        ("aa", "upper", "A", "B"),
+        ("bb", "upper", "B", "C"),
+    ]
+
+
+def test_lower_proof_tiebreak_lex_smallest_step_sequence():
+    # 下界链 C -> A 等权最短两条：
+    #   zz 下界边 C->A 权 -1（一步）
+    #   aa 下界边 C->D 权 -1 + bb 下界边 D->A 权 0（两步，首步四元组更小）
+    result = diagnose(
+        nodes=["A", "C", "D"],
+        reference="A",
+        observations=[
+            _obs("zz", "A", "C", 1, 9),
+            _obs("aa", "D", "C", 1, 9),
+            _obs("bb", "A", "D", 0, 9),
+        ],
+    )
+    by_node = {b["node"]: b for b in result["node_bounds"]}
+    assert by_node["C"]["lower"] == 1.0
+    lp = by_node["C"]["lower_proof"]
+    _assert_contiguous(lp, "C", "A")
+    assert _chain_tuples(lp) == [
+        ("aa", "lower", "C", "D"),
+        ("bb", "lower", "D", "A"),
+    ]
+    assert -sum(s["weight"] for s in lp) == 1.0
+
+
+def test_proof_tiebreak_independent_of_submission_order():
+    obs = [
+        _obs("p1", "A", "C", 0, 1),
+        _obs("q1", "A", "B", 0, 1),
+        _obs("q2", "B", "C", 0, 0),
+        _obs("r1", "A", "B", -1, 10),
+    ]
+    r1 = diagnose(["A", "B", "C"], "A", obs)
+    r2 = diagnose(["A", "B", "C"], "A", list(reversed(obs)))
+
+    def signature(result):
+        return [
+            (
+                b["node"],
+                _chain_tuples(b["upper_proof"]) if b["upper_proof"] is not None else None,
+                _chain_tuples(b["lower_proof"]) if b["lower_proof"] is not None else None,
+            )
+            for b in result["node_bounds"]
+        ]
+
+    assert signature(r1) == signature(r2)
+
+
+def test_proof_tiebreak_skips_zero_weight_dead_ends():
+    # 紧边子图含 0 权环：a0 的上界边 A->X（权 0）四元组最小，
+    # 但 X 只经 x1 到 Y、Y 只能回到 A——该前缀不经过已访问节点就到不了目标 C。
+    # 选链必须跳过死胡同前缀，给出简单链 a(A->B,0) + c(B->C,2)，且不无限循环。
+    result = diagnose(
+        nodes=["A", "B", "C", "X", "Y"],
+        reference="A",
+        observations=[
+            _obs("a", "A", "B", 0, 0),
+            _obs("a0", "A", "X", 0, 0),
+            _obs("x1", "X", "Y", 0, 0),
+            _obs("c", "B", "C", 2, 2),
+        ],
+    )
+    by_node = {b["node"]: b for b in result["node_bounds"]}
+    up = by_node["C"]["upper_proof"]
+    _assert_contiguous(up, "A", "C")
+    assert _chain_tuples(up) == [
+        ("a", "upper", "A", "B"),
+        ("c", "upper", "B", "C"),
+    ]
+    # 简单链：无重复节点
+    visited = ["A"] + [s["to"] for s in up]
+    assert len(visited) == len(set(visited))
+
+
+def test_unreachable_proofs_are_null():
+    result = diagnose(
+        nodes=["A", "B", "D"],
+        reference="A",
+        observations=[_obs("o1", "A", "B", 0, 3), _obs("o2", "D", "D", -1, 1)],
+    )
+    by_node = {b["node"]: b for b in result["node_bounds"]}
+    assert by_node["D"]["upper_proof"] is None
+    assert by_node["D"]["lower_proof"] is None
+    # 可达节点的链权值和与界一致
+    up_b = by_node["B"]["upper_proof"]
+    lp_b = by_node["B"]["lower_proof"]
+    assert sum(s["weight"] for s in up_b) == by_node["B"]["upper"]
+    assert -sum(s["weight"] for s in lp_b) == by_node["B"]["lower"]
+
+
 def test_unreachable_node_marked_unconstrained():
     # D 与参考节点 A 不在同一弱连通分量
     result = diagnose(

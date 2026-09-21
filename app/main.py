@@ -16,6 +16,8 @@ from .models import (
     DiagnosisResponse,
     FeasibleDiagnosis,
     InfeasibleDiagnosis,
+    NodeBounds,
+    ProofStep,
     RepairRequest,
     RepairResponse,
     collect_nodes,
@@ -30,7 +32,7 @@ app = FastAPI(
         "可行时给出相对参考节点的最紧上下界，不可行时返回稳定的矛盾环，"
         "并可进一步给出最小观测删除集合的修复建议。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -44,10 +46,49 @@ def _to_observation(raw) -> Observation:
     )
 
 
+def _proof_steps(steps) -> List[ProofStep]:
+    return [
+        ProofStep(
+            observation_id=s["observation_id"],
+            constraint=s["constraint"],
+            from_=s["from"],
+            to=s["to"],
+            weight=s["weight"],
+        )
+        for s in steps
+    ]
+
+
 def _diagnosis_model(name, result):
     """把 solver 返回的诊断字典包装成响应模型。"""
     if result["feasible"]:
-        return FeasibleDiagnosis(name=name, **result)
+        node_bounds = [
+            NodeBounds(
+                node=b["node"],
+                lower=b["lower"],
+                upper=b["upper"],
+                upper_proof=(
+                    _proof_steps(b["upper_proof"])
+                    if b["upper_proof"] is not None
+                    else None
+                ),
+                lower_proof=(
+                    _proof_steps(b["lower_proof"])
+                    if b["lower_proof"] is not None
+                    else None
+                ),
+                reachable_from_reference=b["reachable_from_reference"],
+                can_reach_reference=b["can_reach_reference"],
+                constrained=b["constrained"],
+            )
+            for b in result["node_bounds"]
+        ]
+        return FeasibleDiagnosis(
+            name=name,
+            reference=result["reference"],
+            node_bounds=node_bounds,
+            unconstrained_nodes=result["unconstrained_nodes"],
+        )
 
     cycle = result["cycle"]
     steps: List[CycleStep] = [

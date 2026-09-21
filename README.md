@@ -5,7 +5,8 @@
 
 1. **可行性判定**：是否存在一组自洽的节点时钟偏移；
 2. **可行时**：给出每个节点相对指定 **参考节点** 的最紧上下界，并标出无法从参考节点
-   双向约束的节点（孤岛 / 单向可达）；
+   双向约束的节点（孤岛 / 单向可达）；每个界同时返回一条由观测边组成的 **证据链**
+   （`upper_proof` / `lower_proof`），沿链逐步累加即可复现该界；
 3. **不可行时**：返回一条由观测 ID 组成的 **矛盾环**、环上每条约束边及累计界限
    （形如 `0 <= -3.0`），环的起点与顺序经过规范化，多次调用结果稳定；
 4. **修复建议**：不可行时在不修改任何原观测的前提下，搜索使剩余系统恢复可行的
@@ -14,6 +15,7 @@
 5. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
+可行时在最短路的紧边子图上贪心提取字典序最小的证据链，
 纯 Python 标准实现，无外部服务依赖。
 
 ---
@@ -117,10 +119,31 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose \
   "name": null,
   "node_bounds": [
     {"node": "A", "lower": 0.0, "upper": 0.0,
+     "lower_proof": [], "upper_proof": [],
      "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
     {"node": "B", "lower": 1.0, "upper": 5.0,
+     "lower_proof": [
+       {"observation_id": "o1", "constraint": "lower",
+        "from": "B", "to": "A", "weight": -1.0}
+     ],
+     "upper_proof": [
+       {"observation_id": "o1", "constraint": "upper",
+        "from": "A", "to": "B", "weight": 5.0}
+     ],
      "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
     {"node": "C", "lower": 3.0, "upper": 9.0,
+     "lower_proof": [
+       {"observation_id": "o2", "constraint": "lower",
+        "from": "C", "to": "B", "weight": -2.0},
+       {"observation_id": "o1", "constraint": "lower",
+        "from": "B", "to": "A", "weight": -1.0}
+     ],
+     "upper_proof": [
+       {"observation_id": "o1", "constraint": "upper",
+        "from": "A", "to": "B", "weight": 5.0},
+       {"observation_id": "o2", "constraint": "upper",
+        "from": "B", "to": "C", "weight": 4.0}
+     ],
      "reachable_from_reference": true, "can_reach_reference": true, "constrained": true}
   ],
   "unconstrained_nodes": []
@@ -130,6 +153,26 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose \
 `lower` / `upper` 即 `x_node - x_reference` 的最紧上下界（毫秒）。
 无法从参考节点方向到达（上界缺失）或无法回到参考节点（下界缺失）的节点，对应界为
 `null`，并被收入 `unconstrained_nodes`。
+
+#### 证据链（`upper_proof` / `lower_proof`）
+
+每个节点的界都附带可逐步复核的证据链：
+
+- `upper_proof`：**从参考节点走到目标节点** 的一条最短链，步骤 `weight` 之和
+  恰好等于 `upper`（例如上例 C：`5.0 + 4.0 = 9.0`）；
+- `lower_proof`：**从目标节点走回参考节点** 的一条最短链，步骤 `weight` 之和
+  的相反数恰好等于 `lower`（例如上例 C：`-(-2.0 + -1.0) = 3.0`）；
+- 参考节点本身没有非平凡链，两条链均为空数组 `[]`；
+- 界不可达时，界与其证据链均为 `null`；
+- 每步包含 `observation_id`、`constraint`（`upper`=对应 `max` 的边，
+  `lower`=对应 `-min` 的边）、`from`、`to`、`weight`；同一步的 `to` 等于
+  下一步的 `from`，沿链首尾相接。
+
+存在多条等权最短链时，选择 **步骤四元组序列**
+`(observation_id, constraint, from, to)` 按字典序比较最小的那条链
+（逐个四元组比较，而非边数最少）。因此结果只取决于观测集合本身，
+**不受观测提交顺序影响**。注意候选只限于简单链：0 权环虽不改变权值和，
+但会凭空延长序列，不参与比较。
 
 #### 不可行响应（矛盾环，示例）
 
@@ -228,8 +271,17 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
     "name": null,
     "node_bounds": [
       {"node": "A", "lower": 0.0, "upper": 0.0,
+       "lower_proof": [], "upper_proof": [],
        "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
       {"node": "B", "lower": -4.0, "upper": -3.0,
+       "lower_proof": [
+         {"observation_id": "o2", "constraint": "upper",
+          "from": "B", "to": "A", "weight": 4.0}
+       ],
+       "upper_proof": [
+         {"observation_id": "o2", "constraint": "lower",
+          "from": "A", "to": "B", "weight": -3.0}
+       ],
        "reachable_from_reference": true, "can_reach_reference": true, "constrained": true}
     ],
     "unconstrained_nodes": []
@@ -322,6 +374,13 @@ HTTP `422` 及详细错误信息。
 
 - 参考节点 `r` 到 `v` 的**最短路** = `x_v - x_r` 的最紧上界；
 - 反图中 `r` 到 `v` 的最短路取负 = 最紧下界；
+- **证据链**：在距离标签下满足「紧边」条件（上界链 `d[v] = d[u] + w`，
+  下界链 `d[u] = w + d[v]`）的边构成最短链子图，其中任意参考节点 ↔ 目标
+  节点的路径权值和都等于对应界；在该子图上贪心地取步骤四元组
+  `(observation_id, constraint, from, to)` 序列字典序最小的**简单链**，
+  即得到 `upper_proof` / `lower_proof`。贪心每步要求所选边的终点在避开
+  已访问节点的前提下仍能到达目标，因此不会被 0 权环引入死循环，
+  也不需要回溯；
 - **负环 ⇔ 不可行**；负环即矛盾环，环上权值之和恒为负；
 - **修复**：穷举删除子集（按删除数量、观测 ID 字典序），首个使剩余图无负环的
   集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解。
@@ -330,17 +389,19 @@ HTTP `422` 及详细错误信息。
 
 - 节点一律按字典序输出；
 - Bellman-Ford 的边按 `(观测 ID, 约束类型 upper<lower)` 排序后松弛，先到先松弛；
+- 证据链的出边按步骤四元组 `(观测 ID, 约束类型 upper<lower, from, to)`
+  排序后贪心选链；因此相同的观测集合无论提交顺序如何，证据链完全一致；
 - 矛盾环先沿前驱回卷，再旋转到 `(起点节点, 观测 ID, 约束类型)` 最小的边作为唯一起点；
-- 因此相同的观测集合无论提交顺序如何，矛盾环与累计界限完全一致。
+- 因此相同的观测集合无论提交顺序如何，证据链、矛盾环与累计界限完全一致。
 
 ## 项目结构
 
 ```
 app/
   main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/health
-  models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、负环提取与规范化、最小删除集合搜索
-tests/         # 算法层与 HTTP 接口测试（38 个用例）
+  models.py    # 请求/响应 Pydantic 模型与入参校验（含证据链步骤模型）
+  solver.py    # 差分约束建模、Bellman-Ford、负环提取与规范化、证据链贪心提取、最小删除集合搜索
+tests/         # 算法层与 HTTP 接口测试（48 个用例）
 Dockerfile
 docker-compose.yml
 ```
