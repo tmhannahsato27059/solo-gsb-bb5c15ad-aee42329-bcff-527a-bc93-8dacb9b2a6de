@@ -90,6 +90,20 @@ class DiagnosisRequest(BaseModel):
         return collect_nodes(self.nodes, self.reference, self.observations)
 
 
+class ProofStep(BaseModel):
+    """证据链中的一步：沿链方向经过的一条约束边。"""
+
+    observation_id: str = Field(..., description="该边来源的观测 ID")
+    constraint: Literal["upper", "lower"] = Field(
+        ..., description="upper=对应 max 约束边，lower=对应 -min 约束边"
+    )
+    from_: str = Field(..., alias="from", description="边的起点节点")
+    to: str = Field(..., description="边的终点节点")
+    weight: float = Field(..., description="该边在差分约束图中的权重（毫秒）")
+
+    model_config = {"populate_by_name": True}
+
+
 class NodeBounds(BaseModel):
     node: str
     lower: Optional[float] = Field(
@@ -97,6 +111,16 @@ class NodeBounds(BaseModel):
     )
     upper: Optional[float] = Field(
         ..., description="x_node - x_reference 的最紧上界（毫秒），不可达时为 null"
+    )
+    lower_proof: Optional[List[ProofStep]] = Field(
+        ...,
+        description="下界证据链：从该节点走回参考节点的约束边序列，"
+        "权重和的相反数等于 lower；参考节点为空链，下界不可达时为 null",
+    )
+    upper_proof: Optional[List[ProofStep]] = Field(
+        ...,
+        description="上界证据链：从参考节点走到该节点的约束边序列，"
+        "权重和等于 upper；参考节点为空链，上界不可达时为 null",
     )
     reachable_from_reference: bool = Field(
         ..., description="参考节点能否沿约束边到达该节点（决定上界）"

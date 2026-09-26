@@ -1,5 +1,7 @@
 """差分约束求解器测试。"""
 
+import itertools
+
 from app.solver import Observation, diagnose, suggest_repair
 
 
@@ -277,3 +279,118 @@ def test_suggest_repair_does_not_mutate_input():
     snapshot = list(obs)
     suggest_repair(nodes=["A", "B"], reference="A", observations=obs, max_repairs=3)
     assert obs == snapshot  # 原列表与观测对象均未改变
+
+
+def _proof_keys(chain):
+    return [(s["observation_id"], s["constraint"], s["from"], s["to"])
+            for s in chain]
+
+
+def test_reference_node_has_empty_proofs():
+    result = diagnose(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[_obs("o1", "A", "B", 0, 5)],
+    )
+    a = next(b for b in result["node_bounds"] if b["node"] == "A")
+    assert a["lower_proof"] == [] and a["upper_proof"] == []
+
+
+def test_proof_chains_sum_to_bounds_and_walk():
+    # o1: x_B - x_A ∈ [1, 5]，o2: x_C - x_B ∈ [2, 4]
+    result = diagnose(
+        nodes=["A", "B", "C"],
+        reference="A",
+        observations=[_obs("o1", "A", "B", 1, 5), _obs("o2", "B", "C", 2, 4)],
+    )
+    by_node = {b["node"]: b for b in result["node_bounds"]}
+    c = by_node["C"]
+    # 上界链：参考节点 -> 目标，权重和 = upper
+    assert _proof_keys(c["upper_proof"]) == [
+        ("o1", "upper", "A", "B"),
+        ("o2", "upper", "B", "C"),
+    ]
+    assert sum(s["weight"] for s in c["upper_proof"]) == c["upper"] == 9.0
+    # 下界链：目标 -> 参考节点，权重和的相反数 = lower
+    assert _proof_keys(c["lower_proof"]) == [
+        ("o2", "lower", "C", "B"),
+        ("o1", "lower", "B", "A"),
+    ]
+    assert sum(s["weight"] for s in c["lower_proof"]) == -c["lower"] == -3.0
+
+
+def test_unreachable_node_proofs_are_none():
+    result = diagnose(
+        nodes=["A", "D"],
+        reference="A",
+        observations=[_obs("solo", "D", "D", -1, 1)],
+    )
+    d = next(b for b in result["node_bounds"] if b["node"] == "D")
+    assert d["lower"] is None and d["lower_proof"] is None
+    assert d["upper"] is None and d["upper_proof"] is None
+
+
+def test_proof_tie_break_lexicographic_and_order_independent():
+    # A->B->D 与 A->C->D 等权（上界 4）；证据链取四元组序列字典序最小者
+    obs = [
+        _obs("o1", "A", "B", 0, 2),
+        _obs("o2", "A", "C", 0, 1),
+        _obs("o3", "B", "D", 0, 2),
+        _obs("o4", "C", "D", 0, 3),
+    ]
+    results = [
+        diagnose(nodes=["A", "B", "C", "D"], reference="A", observations=list(perm))
+        for perm in itertools.permutations(obs)
+    ]
+    first = results[0]["node_bounds"]
+    for r in results[1:]:
+        assert r["node_bounds"] == first  # 与提交顺序无关
+    d = next(b for b in first if b["node"] == "D")
+    assert _proof_keys(d["upper_proof"]) == [
+        ("o1", "upper", "A", "B"),
+        ("o3", "upper", "B", "D"),
+    ]
+    assert _proof_keys(d["lower_proof"]) == [
+        ("o3", "lower", "D", "B"),
+        ("o1", "lower", "B", "A"),
+    ]
+
+
+def test_proof_tie_break_decided_at_later_step():
+    # 两条等权链共享首步 o1，字典序在第二步决胜
+    result = diagnose(
+        nodes=["A", "B", "C", "D", "E"],
+        reference="A",
+        observations=[
+            _obs("o1", "A", "B", 0, 1),
+            _obs("o2", "B", "C", 0, 1),
+            _obs("o3", "B", "D", 0, 1),
+            _obs("o4", "C", "E", 0, 1),
+            _obs("o5", "D", "E", 0, 1),
+        ],
+    )
+    e = next(b for b in result["node_bounds"] if b["node"] == "E")
+    assert _proof_keys(e["upper_proof"]) == [
+        ("o1", "upper", "A", "B"),
+        ("o2", "upper", "B", "C"),
+        ("o4", "upper", "C", "E"),
+    ]
+
+
+def test_proof_chain_stays_simple_around_zero_weight_cycle():
+    # 零权环 A<->B：非简单走法 R->A->B->A->V 四元组序列更小，
+    # 但证据链必须是简单链 R->A->V
+    result = diagnose(
+        nodes=["R", "A", "B", "V"],
+        reference="R",
+        observations=[
+            _obs("z", "R", "A", 0, 0),
+            _obs("a", "A", "B", 0, 0),
+            _obs("b", "A", "V", 0, 0),
+        ],
+    )
+    v = next(b for b in result["node_bounds"] if b["node"] == "V")
+    assert _proof_keys(v["upper_proof"]) == [
+        ("z", "upper", "R", "A"),
+        ("b", "upper", "A", "V"),
+    ]

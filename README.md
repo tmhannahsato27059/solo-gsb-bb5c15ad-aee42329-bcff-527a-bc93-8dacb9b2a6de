@@ -4,8 +4,9 @@
 [差分约束系统](https://en.wikipedia.org/wiki/Difference_constraints) 并完成：
 
 1. **可行性判定**：是否存在一组自洽的节点时钟偏移；
-2. **可行时**：给出每个节点相对指定 **参考节点** 的最紧上下界，并标出无法从参考节点
-   双向约束的节点（孤岛 / 单向可达）；
+2. **可行时**：给出每个节点相对指定 **参考节点** 的最紧上下界，并附带
+   **证据链**（`lower_proof` / `upper_proof`）解释每个界的来源；同时标出
+   无法从参考节点双向约束的节点（孤岛 / 单向可达）；
 3. **不可行时**：返回一条由观测 ID 组成的 **矛盾环**、环上每条约束边及累计界限
    （形如 `0 <= -3.0`），环的起点与顺序经过规范化，多次调用结果稳定；
 4. **修复建议**：不可行时在不修改任何原观测的前提下，搜索使剩余系统恢复可行的
@@ -117,10 +118,25 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose \
   "name": null,
   "node_bounds": [
     {"node": "A", "lower": 0.0, "upper": 0.0,
+     "lower_proof": [], "upper_proof": [],
      "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
     {"node": "B", "lower": 1.0, "upper": 5.0,
+     "lower_proof": [
+       {"observation_id": "o1", "constraint": "lower", "from": "B", "to": "A", "weight": -1.0}
+     ],
+     "upper_proof": [
+       {"observation_id": "o1", "constraint": "upper", "from": "A", "to": "B", "weight": 5.0}
+     ],
      "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
     {"node": "C", "lower": 3.0, "upper": 9.0,
+     "lower_proof": [
+       {"observation_id": "o2", "constraint": "lower", "from": "C", "to": "B", "weight": -2.0},
+       {"observation_id": "o1", "constraint": "lower", "from": "B", "to": "A", "weight": -1.0}
+     ],
+     "upper_proof": [
+       {"observation_id": "o1", "constraint": "upper", "from": "A", "to": "B", "weight": 5.0},
+       {"observation_id": "o2", "constraint": "upper", "from": "B", "to": "C", "weight": 4.0}
+     ],
      "reachable_from_reference": true, "can_reach_reference": true, "constrained": true}
   ],
   "unconstrained_nodes": []
@@ -130,6 +146,22 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose \
 `lower` / `upper` 即 `x_node - x_reference` 的最紧上下界（毫秒）。
 无法从参考节点方向到达（上界缺失）或无法回到参考节点（下界缺失）的节点，对应界为
 `null`，并被收入 `unconstrained_nodes`。
+
+#### 界的证据链（`lower_proof` / `upper_proof`）
+
+每个非 `null` 的界都附带一条证据链，解释该界由哪些观测的哪条约束边推出：
+
+- `upper_proof`：从 **参考节点走到该节点** 的约束边序列，各步 `weight` 之和恰等于
+  `upper`；
+- `lower_proof`：从 **该节点走回参考节点** 的约束边序列，各步 `weight` 之和的
+  **相反数** 恰等于 `lower`；
+- 每一步包含 `observation_id`（来源观测）、`constraint`（`upper` = 该观测的 `max`
+  约束边，`lower` = `-min` 约束边）、`from` / `to`（沿链方向的端点）与 `weight`；
+- **参考节点** 到自身使用 **空链**（`[]`）；某方向不可达时，对应界与证据链
+  **均为 `null`**；
+- 等权最短链可能有多条：规范选择 **步骤四元组
+  `(observation_id, constraint, from, to)` 序列字典序最小** 的简单链，
+  结果与观测的提交顺序无关。
 
 #### 不可行响应（矛盾环，示例）
 
@@ -228,8 +260,15 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
     "name": null,
     "node_bounds": [
       {"node": "A", "lower": 0.0, "upper": 0.0,
+       "lower_proof": [], "upper_proof": [],
        "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
       {"node": "B", "lower": -4.0, "upper": -3.0,
+       "lower_proof": [
+         {"observation_id": "o2", "constraint": "upper", "from": "B", "to": "A", "weight": 4.0}
+       ],
+       "upper_proof": [
+         {"observation_id": "o2", "constraint": "lower", "from": "A", "to": "B", "weight": -3.0}
+       ],
        "reachable_from_reference": true, "can_reach_reference": true, "constrained": true}
     ],
     "unconstrained_nodes": []
@@ -323,6 +362,8 @@ HTTP `422` 及详细错误信息。
 - 参考节点 `r` 到 `v` 的**最短路** = `x_v - x_r` 的最紧上界；
 - 反图中 `r` 到 `v` 的最短路取负 = 最紧下界；
 - **负环 ⇔ 不可行**；负环即矛盾环，环上权值之和恒为负；
+- **证据链**：上界链为 `r` 到 `v` 的最短路本身（沿原图方向），下界链为 `v` 到 `r`
+  的最短路本身；链即界的可审计解释；
 - **修复**：穷举删除子集（按删除数量、观测 ID 字典序），首个使剩余图无负环的
   集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解。
 
@@ -331,7 +372,9 @@ HTTP `422` 及详细错误信息。
 - 节点一律按字典序输出；
 - Bellman-Ford 的边按 `(观测 ID, 约束类型 upper<lower)` 排序后松弛，先到先松弛；
 - 矛盾环先沿前驱回卷，再旋转到 `(起点节点, 观测 ID, 约束类型)` 最小的边作为唯一起点；
-- 因此相同的观测集合无论提交顺序如何，矛盾环与累计界限完全一致。
+- 证据链在等权最短链中取步骤四元组 `(observation_id, constraint, from, to)`
+  序列字典序最小的简单链（逐位贪心选择，四元组在边集合内唯一）；
+- 因此相同的观测集合无论提交顺序如何，上下界、证据链、矛盾环与累计界限完全一致。
 
 ## 项目结构
 
@@ -339,8 +382,8 @@ HTTP `422` 及详细错误信息。
 app/
   main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/health
   models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、负环提取与规范化、最小删除集合搜索
-tests/         # 算法层与 HTTP 接口测试（38 个用例）
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索
+tests/         # 算法层与 HTTP 接口测试（52 个用例）
 Dockerfile
 docker-compose.yml
 ```

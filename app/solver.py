@@ -21,6 +21,22 @@
 
 所有结果的顺序均按 (观测 ID, 约束类型) / 节点字典序确定，保证稳定输出。
 
+界的证据链
+----------
+可行时每个节点的界都附带一条证据链（最短路本身），便于审计界的来源：
+
+* ``upper_proof``：从参考节点沿原图方向走到目标节点的约束边序列，
+  各步权重之和恰等于 ``upper``；
+* ``lower_proof``：从目标节点沿原图方向走回参考节点的约束边序列，
+  各步权重之和的相反数恰等于 ``lower``；
+* 参考节点到自身为**空链**；某方向不可达时对应界与证据链均为 ``None``。
+
+等权最短路可能有多条，规范选择为「步骤四元组
+``(observation_id, constraint, from, to)`` 序列字典序最小」的简单链：
+逐位贪心，每一步在所有仍能延伸成最短链的候选边中取四元组最小者。
+四元组唯一标识一条边，因此选择只依赖观测集合本身，
+与观测的提交顺序无关。
+
 修复建议
 --------
 ``suggest_repair`` 在不修改任何观测的前提下，搜索使剩余系统恢复可行的
@@ -197,6 +213,137 @@ def _canonicalize_cycle(cycle_edges: List[Edge]) -> List[Edge]:
     return cycle_edges[start_index:] + cycle_edges[:start_index]
 
 
+def _chain_key(e: Edge) -> Tuple[str, str, str, str]:
+    """证据链步骤的四元组排序键：(observation_id, constraint, from, to)。
+
+    同一观测的 upper/lower 边端点互异（自环观测除外，但自环边不可能
+    出现在简单链中），因此四元组在边集合内唯一，比较结果与输入顺序无关。
+    """
+    return (e.observation_id, e.kind, e.u, e.v)
+
+
+def _distances_to_goal(
+    nodes: Sequence[str],
+    edges: Sequence[Edge],
+    goal: str,
+    excluded: set,
+) -> dict:
+    """各节点沿原图方向到 goal 的最短路长度（在删除 excluded 节点的图上）。
+
+    通过在反图上从 goal 跑 Bellman-Ford 得到；不可达节点距离为 inf。
+    """
+    if goal in excluded:  # 调用方保证不发生，防御性处理
+        return {}
+    remaining = [n for n in nodes if n not in excluded]
+    reverse_edges = [
+        Edge(
+            u=e.v,
+            v=e.u,
+            weight=e.weight,
+            observation_id=e.observation_id,
+            kind=e.kind,
+            bound=e.bound,
+        )
+        for e in edges
+        if e.u not in excluded and e.v not in excluded
+    ]
+    dist, _ = _bellman_ford(reverse_edges, remaining, goal)
+    return dist
+
+
+def _lex_min_chain(
+    nodes: Sequence[str],
+    edges: Sequence[Edge],
+    start: str,
+    goal: str,
+    total: float,
+) -> Optional[List[Edge]]:
+    """从 start 到 goal、权重和为 total 的简单链中字典序最小者。
+
+    字典序按步骤四元组 ``(observation_id, constraint, from, to)`` 的序列
+    比较。前提：图中无负环、goal 从 start 可达、total 为最短路长度。
+
+    算法：逐位贪心。维护不变式「已走权重 + 当前节点避开已访节点到 goal
+    的最短路 = total」，每步在所有仍能把链延伸成最短简单链的候选边中
+    选四元组最小者。候选可行性只依赖距离值与边集合，与边的输入顺序无关。
+
+    浮点病态（精确相等失效导致无候选边）时返回 None，由调用方回退。
+    """
+    if start == goal:
+        return []
+    chain: List[Edge] = []
+    visited = {start}
+    cur = start
+    acc = 0.0  # 已走链的权重和
+    while cur != goal:
+        # 剩余链必须避开 visited 中的节点（简单链），先算各节点到 goal 的距离
+        d_rem = _distances_to_goal(nodes, edges, goal, visited)
+        best: Optional[Edge] = None
+        for e in edges:
+            if e.u != cur or e.v in visited:
+                continue
+            if acc + e.weight + d_rem[e.v] != total:
+                continue
+            if best is None or _chain_key(e) < _chain_key(best):
+                best = e
+        if best is None:
+            return None
+        chain.append(best)
+        visited.add(best.v)
+        acc += best.weight
+        cur = best.v
+    return chain
+
+
+def _predecessor_chain(
+    prev: dict, start: str, goal: str
+) -> Optional[List[Edge]]:
+    """沿 Bellman-Ford 前驱指针从 goal 回溯到 start，恢复 start->goal 的边序列。"""
+    chain: List[Edge] = []
+    cur = goal
+    while cur != start:
+        e = prev.get(cur)
+        if e is None:  # 理论上不会发生，防御性处理
+            return None
+        chain.append(e)
+        cur = e.u
+    chain.reverse()
+    return chain
+
+
+def _proof_steps(chain: Sequence[Edge]) -> List[dict]:
+    """把边序列转换为证据链步骤字典。"""
+    return [
+        {
+            "observation_id": e.observation_id,
+            "constraint": e.kind,
+            "from": e.u,
+            "to": e.v,
+            "weight": _norm(e.weight),
+        }
+        for e in chain
+    ]
+
+
+def _unreverse(e: Edge) -> Edge:
+    """把反图边还原为原图方向的边。"""
+    return Edge(
+        u=e.v,
+        v=e.u,
+        weight=e.weight,
+        observation_id=e.observation_id,
+        kind=e.kind,
+        bound=e.bound,
+    )
+
+
+def _is_feasible(nodes: Sequence[str], observations: Sequence[Observation]) -> bool:
+    """判断约束系统是否可行（无负环）；供修复搜索做快速可行性检查。"""
+    ordered_nodes = sorted(set(nodes))
+    edges = _build_edges(observations)
+    return _extract_negative_cycle(edges, ordered_nodes) is None
+
+
 def diagnose(
     nodes: Sequence[str],
     reference: str,
@@ -207,6 +354,11 @@ def diagnose(
     返回字典：
       可行   -> {"feasible": True, "reference": ..., "node_bounds": [...],
                  "unconstrained_nodes": [...]}
+                每个 node_bounds 条目附带 lower_proof / upper_proof 证据链
+                （步骤为 observation_id/constraint/from/to/weight 字典）：
+                上界链从参考节点走到该节点、权重和等于 upper；
+                下界链从该节点走回参考节点、权重和的相反数等于 lower；
+                参考节点为空链，不可达方向的界与证据链均为 None。
       不可行 -> {"feasible": False, "cycle": {"steps": [...],
                  "accumulated_bound": float, "contradiction": str}}
     """
@@ -238,22 +390,12 @@ def diagnose(
         }
 
     # 可行：正向最短路给出最紧上界。
-    dist, _ = _bellman_ford(edges, ordered_nodes, reference)
+    dist, prev = _bellman_ford(edges, ordered_nodes, reference)
 
     # 反图最短路 dist_rev[v] = 原图 v -> reference 的最短路，
     # 于是最紧下界 x_v - x_r >= -dist_rev[v]。
-    reverse_edges = [
-        Edge(
-            u=e.v,
-            v=e.u,
-            weight=e.weight,
-            observation_id=e.observation_id,
-            kind=e.kind,
-            bound=e.bound,
-        )
-        for e in edges
-    ]
-    dist_rev, _ = _bellman_ford(reverse_edges, ordered_nodes, reference)
+    reverse_edges = [_unreverse(e) for e in edges]
+    dist_rev, prev_rev = _bellman_ford(reverse_edges, ordered_nodes, reference)
 
     inf = float("inf")
     node_bounds = []
@@ -266,11 +408,33 @@ def diagnose(
         constrained = reachable_forward and reachable_reverse
         if not constrained:
             unconstrained.append(v)
+
+        # 证据链：规范（四元组序列字典序最小）的最短简单链；
+        # 浮点病态下回退到前驱指针链（仍为最短路，仅字典序不保证）。
+        if reachable_forward:
+            chain = _lex_min_chain(ordered_nodes, edges, reference, v, dist[v])
+            if chain is None:
+                chain = _predecessor_chain(prev, reference, v) or []
+            upper_proof = _proof_steps(chain)
+        else:
+            upper_proof = None
+
+        if reachable_reverse:
+            chain = _lex_min_chain(ordered_nodes, edges, v, reference, dist_rev[v])
+            if chain is None:
+                rev_chain = _predecessor_chain(prev_rev, reference, v) or []
+                chain = [_unreverse(e) for e in reversed(rev_chain)]
+            lower_proof = _proof_steps(chain)
+        else:
+            lower_proof = None
+
         node_bounds.append(
             {
                 "node": v,
                 "lower": lower,
                 "upper": upper,
+                "lower_proof": lower_proof,
+                "upper_proof": upper_proof,
                 "reachable_from_reference": reachable_forward,
                 "can_reach_reference": reachable_reverse,
                 "constrained": constrained,
@@ -308,7 +472,7 @@ def suggest_repair(
     调用方应把删除上限控制在较小范围。
     """
     ordered = sorted(observations, key=lambda o: o.id)
-    if diagnose(nodes, reference, ordered)["feasible"]:
+    if _is_feasible(nodes, ordered):
         return [], list(ordered)
 
     budget = max(0, min(max_repairs, len(ordered)))
@@ -316,6 +480,6 @@ def suggest_repair(
         for combo in itertools.combinations(ordered, k):
             removed = {o.id for o in combo}
             remaining = [o for o in ordered if o.id not in removed]
-            if diagnose(nodes, reference, remaining)["feasible"]:
+            if _is_feasible(nodes, remaining):
                 return [o.id for o in combo], remaining
     return None, None
